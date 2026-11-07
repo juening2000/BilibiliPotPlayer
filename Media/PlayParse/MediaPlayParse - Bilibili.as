@@ -630,6 +630,18 @@ void loadVideoPlayerInfo(string bvid, string cid, dictionary &MetaData, array<di
 	}
 }
 
+// The video-info API exposes the same counters the Bilibili page shows below
+// the player: 点赞 / 投币 / 收藏 / 转发.
+string videoStatLine(JsonValue stat) {
+	if (!stat.isObject()) return "";
+	string line;
+	if (stat["like"].isNumeric()) line += "点赞 " + stat["like"].asString();
+	if (stat["coin"].isNumeric()) line += (line.empty() ? "" : "  ") + "投币 " + stat["coin"].asString();
+	if (stat["favorite"].isNumeric()) line += (line.empty() ? "" : "  ") + "收藏 " + stat["favorite"].asString();
+	if (stat["share"].isNumeric()) line += (line.empty() ? "" : "  ") + "转发 " + stat["share"].asString();
+	return line;
+}
+
 string Video(string bvid, const string &in path, dictionary &MetaData, array<dictionary> &QualityList) {
 	uint started = HostGetTickCount();
 	string aid = parse(path, "aid");
@@ -644,37 +656,68 @@ string Video(string bvid, const string &in path, dictionary &MetaData, array<dic
 	string webUrl = path;
 	MetaData["webUrl"] = makeWebUrl(webUrl);
 
-	if (aid.empty() || cid.empty()) {
+	// Season playlist items already carry aid/cid, so the original fast path
+	// skipped /x/web-interface/view and the item lost the description and the
+	// 点赞/投币/收藏/转发 counters shown below the title. Fetch the basic info
+	// once for the item that actually plays, using aid when bvid is unavailable.
+	string existingLike;
+	bool hasStats = MetaData.get("likeCount", existingLike) && !existingLike.empty();
+	string viewQuery;
+	if (!bvid.empty()) viewQuery = "bvid=" + bvid;
+	else if (!aid.empty()) viewQuery = "aid=" + aid;
+	if (!viewQuery.empty() && (aid.empty() || cid.empty() || !hasStats)) {
 		JsonReader reader;
 		JsonValue root;
-		string res = apiPost("/x/web-interface/view?bvid=" + bvid);
-		if (!reader.parse(res, root) || !root.isObject() || !root["code"].isNumeric() || root["code"].asInt() != 0) return "";
-		JsonValue data = root["data"];
-		JsonValue pages = data["pages"];
-		if (!pages.isArray() || pages.size() == 0) return "";
-		if (!cid.empty()) {
-			for (int i = 0; i < pages.size(); i++) {
-				if (pages[i]["cid"].asString() == cid) { p = i + 1; break; }
+		string res = apiPost("/x/web-interface/view?" + viewQuery);
+		bool parsed = reader.parse(res, root) && root.isObject() && root["code"].isNumeric() && root["code"].asInt() == 0;
+		// Metadata is optional for an already-resolved episode; never block playback.
+		if (!parsed && (aid.empty() || cid.empty())) return "";
+		if (parsed) {
+			JsonValue data = root["data"];
+			JsonValue pages = data["pages"];
+			bool pagesValid = pages.isArray() && pages.size() > 0;
+			if (aid.empty()) aid = data["aid"].asString();
+			if (cid.empty()) {
+				if (!pagesValid) return "";
+				if (p < 1 || p > pages.size()) return "";
+				cid = pages[p-1]["cid"].asString();
 			}
-		}
-		if (p < 1 || p > pages.size()) return "";
-		aid = data["aid"].asString();
-		cid = pages[p-1]["cid"].asString();
-		title = pages[p-1]["part"].asString();
-		if (title.empty()) title = data["title"].asString();
-		MetaData["title"] = title;
-		MetaData["author"] = data["owner"]["name"].asString();
-		MetaData["viewCount"] = data["stat"]["view"].asString();
-		MetaData["likeCount"] = data["stat"]["like"].asString();
-		MetaData["thumbnail"] = data["pic"].asString();
-		string desc = data["desc"].asString();
-		MetaData["content"] = title + (desc.empty() ? "" : " | " + desc);
-		string redirect = data["redirect_url"].asString();
-		if (redirect.find("bangumi/play/ep") >= 0) {
-			epid = HostRegExpParse(redirect, "bangumi/play/ep([0-9]+)");
-			ispgc = true;
-			webUrl = redirect;
-			MetaData["webUrl"] = makeWebUrl(webUrl);
+			if (cid.empty()) return "";
+			// Keep the episode title supplied by the season endpoint, if any.
+			string existingTitle;
+			if (!MetaData.get("title", existingTitle) || existingTitle.empty()) {
+				if (pagesValid) {
+					for (int i = 0; i < pages.size(); i++) {
+						if (pages[i]["cid"].asString() == cid) { title = pages[i]["part"].asString(); break; }
+					}
+				}
+				if (title.empty()) title = data["title"].asString();
+				if (!title.empty()) MetaData["title"] = title;
+			} else {
+				title = existingTitle;
+			}
+			MetaData["author"] = data["owner"]["name"].asString();
+			JsonValue stat = data["stat"];
+			if (stat.isObject()) {
+				MetaData["viewCount"] = stat["view"].asString();
+				MetaData["likeCount"] = stat["like"].asString();
+				MetaData["coinCount"] = stat["coin"].asString();
+				MetaData["favoriteCount"] = stat["favorite"].asString();
+				MetaData["shareCount"] = stat["share"].asString();
+			}
+			MetaData["thumbnail"] = data["pic"].asString();
+			string desc = data["desc"].asString();
+			string statLine = videoStatLine(stat);
+			MetaData["content"] = title + (desc.empty() ? "" : " | " + desc) + (statLine.empty() ? "" : "\n" + statLine);
+			if (epid.empty()) {
+				string redirect = data["redirect_url"].asString();
+				if (redirect.find("bangumi/play/ep") >= 0) {
+					epid = HostRegExpParse(redirect, "bangumi/play/ep([0-9]+)");
+					ispgc = true;
+					webUrl = redirect;
+					MetaData["webUrl"] = makeWebUrl(webUrl);
+				}
+			}
 		}
 	}
 	if (aid.empty() || cid.empty()) return "";
