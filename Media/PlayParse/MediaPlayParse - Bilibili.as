@@ -25,13 +25,39 @@
 Config ConfigData;
 
 void OnInitialize() {
-	HostSetUrlHeaderHTTP("bilivideo.com", "Referer: https://www.bilibili.com\r\n");
-	HostSetUrlHeaderHTTP("bilivideo.cn", "Referer: https://www.bilibili.com\r\n");
-	HostSetUrlHeaderHTTP("bilibili.com", "Referer: https://www.bilibili.com\r\n");
+	configureStreamHost("bilivideo.com");
+	configureStreamHost("bilivideo.cn");
+	configureStreamHost("bilibili.com");
 }
 
 string host = "https://api.bilibili.com";
 string mixin_key;
+array<string> configuredStreamHosts;
+string preflightRequest;
+string preflightResponse;
+uint preflightTime = 0;
+
+void configureStreamHost(string domain) {
+	if (domain.empty() || configuredStreamHosts.find(domain) >= 0) return;
+	// Use PotPlayer's dedicated fields instead of a raw Referer header. Set the
+	// exact returned CDN host too: international streams can use akamaized.net.
+	HostSetUrlHeaderHTTP(domain, "");
+	HostSetUrlRefererHTTP(domain, "https://www.bilibili.com");
+	HostSetUrlUserAgentHTTP(domain, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+	configuredStreamHosts.insertLast(domain);
+}
+// Only short-lived metadata is cached. Signed media URLs are always fetched anew.
+array<string> metadataKeys;
+array<string> metadataValues;
+array<uint> metadataTimes;
+
+void clearMetadataCache() {
+	metadataKeys.resize(0);
+	metadataValues.resize(0);
+	metadataTimes.resize(0);
+	preflightRequest = "";
+	preflightResponse = "";
+}
 
 string GetTitle() {
 	return "Bilibili";
@@ -103,6 +129,8 @@ string ServerLogin(string User, string Pass)
 		return "配置文件不存在";
 	}
 	ConfigData = ReadConfigFile(User);
+	clearMetadataCache();
+	mixin_key = "";
 	if (ConfigData.debug) {
 		HostOpenConsole();
 	}
@@ -111,7 +139,10 @@ string ServerLogin(string User, string Pass)
 }
 
 bool isFileExists(string path) {
-	return HostFileOpen(path) > 0;
+	uintptr file = HostFileOpen(path);
+	if (file == 0) return false;
+	HostFileClose(file);
+	return true;
 }
 
 class Config {
@@ -126,6 +157,9 @@ class Config {
 	float danmakuDisplayArea = 0.8;
 	float danmakuStayTime = 15.0;
 	bool showRecommendedVideos = true;
+	bool loadPlayerInfo = true;
+	bool enumerateProgressiveQualities = false;
+	bool bangumiIncludeExtras = false;
 	bool debug = false;
 
 	string danmakuUrl;
@@ -134,9 +168,18 @@ class Config {
 	int maxliveroom = 200;
 };
 
+bool retiredDanmakuServer(string server) {
+	// The original sample config points here; DNS no longer resolves (2026-11-06).
+	// Do not hand this dead subtitle URL to PotPlayer and delay its media open.
+	return HostRegExpParse(server, "^https?://([^/]+)") == "subtitle.chen310.repl.co";
+}
+
 Config ReadConfigFile(string file) {
 	Config config;
-	config.fullConfig = HostFileRead(HostFileOpen(file), 10000);
+	uintptr fp = HostFileOpen(file);
+	if (fp == 0) return config;
+	config.fullConfig = HostFileRead(fp, 10000);
+	HostFileClose(fp);
 	JsonReader reader;
 	JsonValue root;
 	if (reader.parse(config.fullConfig, root) && root.isObject()) {
@@ -145,7 +188,7 @@ Config ReadConfigFile(string file) {
 			array<string> cookies = config.cookie.split(";");
 			for (uint i=0; i < cookies.length(); i++) {
 				if (cookies[i].find("DedeUserID=") >= 0) {
-					ConfigData.uid = parseInt(cookies[i].split("=")[1]);
+					config.uid = parseInt(cookies[i].split("=")[1]);
 					break;
 				}
 			}
@@ -183,7 +226,16 @@ Config ReadConfigFile(string file) {
 		if (root["debug"].isBool()) {
 			config.debug = root["debug"].asBool();
 		}
-		if (!config.danmakuServer.empty()) {
+		if (root["loadPlayerInfo"].isBool()) {
+			config.loadPlayerInfo = root["loadPlayerInfo"].asBool();
+		}
+		if (root["enumerateProgressiveQualities"].isBool()) {
+			config.enumerateProgressiveQualities = root["enumerateProgressiveQualities"].asBool();
+		}
+		if (root["bangumiIncludeExtras"].isBool()) {
+			config.bangumiIncludeExtras = root["bangumiIncludeExtras"].asBool();
+		}
+		if (!config.danmakuServer.empty() && !retiredDanmakuServer(config.danmakuServer)) {
 			config.danmakuUrl = config.danmakuServer +  "/subtitle?font=" + HostUrlEncode(config.danmakuFont) + "&font_size=" + config.danmakuFontSize + "&alpha=" + config.danmakuOpacity + "&display_area=" + config.danmakuDisplayArea + "&duration_marquee=" + config.danmakuStayTime + "&duration_still=" + config.danmakuStayTime + "&cid=";
 			config.subtitleUrl = config.danmakuServer + "/subtitle?url=";
 		}
@@ -236,11 +288,40 @@ string post(string url, string data="") {
 		Headers += "Cookie: " + ConfigData.cookie + "\r\n";
 	}
 	log("request", url);
-	return HostUrlGetStringWithAPI(url, UserAgent, Headers, data, true);
+	uint started = HostGetTickCount();
+	string response = HostUrlGetStringWithAPI(url, UserAgent, Headers, data, true);
+	log("request elapsed ms", int(HostGetTickCount() - started));
+	return response;
 }
 
 string apiPost(string api, string data="") {
-	return post(host + api);
+	bool cacheable = data.empty() && (api.find("/x/web-interface/view?") == 0
+		|| api.find("/pgc/view/web/season?") == 0 || api.find("/pgc/web/season/section?") == 0
+		|| api.find("/x/player/wbi/v2?") == 0);
+	int index = metadataKeys.find(api);
+	if (cacheable && index >= 0 && uint(HostGetTickCount() - metadataTimes[index]) < 30000) {
+		log("metadata cache hit", api);
+		return metadataValues[index];
+	}
+	string response = post(host + api, data);
+	JsonReader reader;
+	JsonValue root;
+	if (cacheable && reader.parse(response, root) && root.isObject() && root["code"].isNumeric() && root["code"].asInt() == 0) {
+		if (index >= 0) {
+			metadataValues[index] = response;
+			metadataTimes[index] = HostGetTickCount();
+		} else {
+			if (metadataKeys.length() >= 6) {
+				metadataKeys.removeAt(0);
+				metadataValues.removeAt(0);
+				metadataTimes.removeAt(0);
+			}
+			metadataKeys.insertLast(api);
+			metadataValues.insertLast(response);
+			metadataTimes.insertLast(HostGetTickCount());
+		}
+	}
+	return response;
 }
 
 string getMixinKey() {
@@ -378,274 +459,264 @@ string makeWebUrl(string path) {
 	return url + "?p=" + p;
 }
 
-string Video(string bvid, const string &in path, dictionary &MetaData, array<dictionary> &QualityList) {
-	log("--------------------------------------------------");
-	string res;
-	string aid = parse(path, "aid");
-	string title;
-	string url;
-	JsonReader reader;
-	JsonValue root;
-	int qn = 127;
-	string cid = parse(path, "cid");
-	int p = parseInt(parse(path, "p", "1"));
-	bool ispgc = false;
-	string webUrl = path;
-	array<dictionary> subtitle;
-
-	if (aid.empty()) {
-		res = apiPost("/x/web-interface/view?bvid=" + bvid);
-	if (res.empty()) {
-		log("Video view API response EMPTY", bvid);
-		return url;
-	}
-	if (reader.parse(res, root) && root.isObject()) {
-		if (root["code"].asInt() == 0) {
-			JsonValue data = root["data"];
-			aid = data["aid"].asString();
-			if (!cid.empty()) {
-				for (int i = 0; i < data["pages"].size(); i++) {
-					if (data["pages"][i]["cid"].asString() == cid) {
-						p = i + 1;
-						break;
-					}
-				}
-			}
-			cid = data["pages"][p-1]["cid"].asString();
-			title = data["pages"][p-1]["part"].asString();
-			MetaData["author"] = data["owner"]["name"].asString();
-			MetaData["viewCount"] = data["stat"]["view"].asString();
-			MetaData["likeCount"] = data["stat"]["like"].asString();
-			MetaData["thumbnail"] = data["pic"].asString();
-			string desc = data["desc"].asString();
-			if (desc.empty()) {
-				MetaData["content"] = title;
-			} else {
-				MetaData["content"] = title + " | " + desc;
-			}
-			JsonValue redirect_url = data["redirect_url"];
-			string ep_id;
-			if (redirect_url.isString() && redirect_url.asString().find("bangumi/play/ep") >= 0) {
-				webUrl = redirect_url.asString();
-				ispgc = true;
-				ep_id = HostRegExpParse(redirect_url.asString(), "bangumi/play/ep([0-9]+)");
-				log("Video ispgc detected", webUrl);
-				log("Video ep_id", ep_id);
-			}
-			MetaData["webUrl"] = makeWebUrl(webUrl);
-			if (ConfigData.danmakuEnable) {
-				dictionary dic;
-				dic["name"] = "【弹幕】" + title;
-				dic["url"] = ConfigData.danmakuUrl + cid;
-				subtitle.insertLast(dic);
-			}
-		} else {
-			log("Video view API code != 0", root["code"].asInt());
-			log("Video view API message", root["message"].asString());
-			return url;
+// Keep each signed CDN URL intact; prefer an HTTPS CDN backup over an mcdn peer.
+string streamUrl(JsonValue stream) {
+	string selected = stream["baseUrl"].asString();
+	if (selected.empty()) selected = stream["base_url"].asString();
+	if (selected.empty()) selected = stream["url"].asString();
+	JsonValue backups = stream["backupUrl"];
+	if (!backups.isArray()) backups = stream["backup_url"];
+	for (int i = 0; i < backups.size(); i++) {
+		string candidate = backups[i].asString();
+		bool selectedPeer = selected.find(".mcdn.") >= 0 || selected.find(":4483/") >= 0;
+		bool candidatePeer = candidate.find(".mcdn.") >= 0 || candidate.find(":4483/") >= 0;
+		if (selected.empty() || (selectedPeer && !candidatePeer && candidate.find("https://") == 0)) {
+			selected = candidate;
 		}
 	}
-} else {
-	log("Video skip view API, aid known", aid);
-	ispgc = true;
+	if (!selected.empty()) configureStreamHost(HostRegExpParse(selected, "^https?://([^/:]+)"));
+	return selected;
 }
 
-	res = apiPost("/x/player/wbi/v2?bvid=" + bvid + "&cid=" + cid);
-	if (res.empty()) {
-		return url;
-	}
-	if (reader.parse(res, root) && root.isObject()) {
-		if (root["code"].asInt() == 0) {
-			JsonValue data = root["data"];
-			if (ConfigData.danmakuEnable) {
-				JsonValue subs;
-				subs = root["data"]["subtitle"]["subtitles"];
-				if (subs.isArray()) {
-					for (int i = 0; i < subs.size(); i++) {
-						JsonValue sub = subs[i];
-						dictionary dic;
-						dic["name"] = "【字幕】" + sub["lan_doc"].asString();
-						if (sub["subtitle_url"].asString().find("http") == 0) {
-							dic["url"] = ConfigData.subtitleUrl + sub["subtitle_url"].asString();
-						} else {
-							dic["url"] = ConfigData.subtitleUrl + "http:" + sub["subtitle_url"].asString();
-						}
-						subtitle.insertLast(dic);
-					}
-				}
-				if (!subtitle.empty()) {
-					MetaData["subtitle"] = subtitle;
-				}
-			}
-			JsonValue points = data["view_points"];
-			if (points.isArray()) {
-				array<dictionary> chapt;
-				for (int i = 0; i < points.size(); i++) {
-					JsonValue point = points[i];
-					dictionary item;
-					item["title"] = point["content"].asString();
-					item["time"] = formatUInt(point["from"].asInt() * 1000);
-					chapt.insertLast(item);
-				}
-				if (!chapt.empty() && (@QualityList !is null)) {
-					MetaData["chapter"] = chapt;
-				}
-			}
-		} else {
-			return url;
-		}
-	}
-	status = 3;
+JsonValue videoPlayData(string aid, string cid, string bvid, string epid, bool ispgc, int qn, bool progressive=false, bool preflight=false) {
+	string endpoint = ispgc ? "/pgc/player/web/playurl?" : "/x/player/playurl?";
+	// PGC's current capabilities expose 122 (4K SDR enhanced) on supported titles.
+	// This archived API reference predates 122. See reference/SOURCES.md.
+	string fnval = progressive ? "1" : (ispgc ? "143312" : "4048");
+	string query = "avid=" + aid + "&cid=" + cid
+		+ "&qn=" + qn + "&fnver=0&fnval=" + fnval + "&fourk=1";
+	if (!bvid.empty()) query += "&bvid=" + bvid;
 	if (ispgc) {
-		log("PGC try regular playurl first, avid=" + aid + " cid=" + cid);
-		res = apiPost("/x/player/playurl?avid=" + aid + "&cid=" + cid + "&qn=" + qn + "&fnval=4048&fourk=1");
+		if (!epid.empty()) query += "&ep_id=" + epid;
+		query += "&drm_tech_type=3";
+	}
+	JsonReader reader;
+	JsonValue root;
+	string request = endpoint + query;
+	string response;
+	if (preflight) {
+		preflightRequest = "";
+		preflightResponse = "";
+	}
+	// PotPlayer first calls without QualityList, then immediately with it. Consume
+	// that one preliminary result once, rather than fetching the same playurl twice.
+	if (!preflight && !progressive && preflightRequest == request && uint(HostGetTickCount() - preflightTime) < 5000) {
+		response = preflightResponse;
+		preflightRequest = "";
+		preflightResponse = "";
+		log("Reusing preliminary playurl once");
 	} else {
-		res = apiPost("/x/player/playurl?avid=" + aid + "&cid=" + cid + "&qn=" + qn + "&fnval=4048&fourk=1");
+		response = apiPost(request);
 	}
-	if (res.empty()) {
-		log("Video playurl response EMPTY");
-		return url;
+	log("playurl raw response bytes", response.length());
+	if (reader.parse(response, root) && root.isObject() && root["code"].isNumeric() && root["code"].asInt() == 0) {
+		log("playurl response bytes", response.length());
+		if (preflight && !progressive && (root["result"].isObject() || root["data"].isObject())) {
+			preflightRequest = request;
+			preflightResponse = response;
+			preflightTime = HostGetTickCount();
+		}
+		if (root["result"].isObject()) return root["result"];
+		if (root["data"].isObject()) return root["data"];
 	}
-	if (reader.parse(res, root) && root.isObject()) {
-		if (root["code"].asInt() == 0) {
-			JsonValue data = root["data"];
+	log("playurl failed", root["code"].asInt());
+	return JsonValue();
+}
 
-			if (data["dash"].isObject()) {
-				JsonValue videos = data["dash"]["video"];
-				if (@QualityList !is null) {
-					for (int i = 0; i < videos.size(); i++) {
-						int quality = videos[i]["id"].asInt();
-						dictionary qualityitem;
-						int codecid = videos[i]["codecid"].asInt();
-						url = videos[i]["baseUrl"].asString();
-						qualityitem["url"] = url;
-						int itag = videos[i]["id"].asInt() * 10 + codecid;
-						int trueitag = getTrueItag(itag);
-						qualityitem["quality"] = getVideoquality(quality) + getCodec(codecid);
-						qualityitem["qualityDetail"] = qualityitem["quality"];
-						qualityitem["itag"] = trueitag;
-						QualityList.insertLast(qualityitem);
-					}
-				}
-				if (data["dash"]["dolby"]["audio"].isArray()){
-					string dolbyquality;
-					dolbyquality = formatFloat(data["dash"]["dolby"]["audio"][0]["bandwidth"].asInt() / 1000.0, "", 0, 1) + "K";
-					dictionary dolbyqualityitem;
-					dolbyqualityitem["url"] = data["dash"]["dolby"]["audio"][0]["baseUrl"].asString();
-					dolbyqualityitem["quality"] = "EC-3 " + dolbyquality;
-					dolbyqualityitem["qualityDetail"] = dolbyqualityitem["quality"];
-					dolbyqualityitem["itag"] = 328;
-					QualityList.insertLast(dolbyqualityitem);
-				}
-				if (data["dash"]["flac"].isObject()){
-					string flacquality;
-					flacquality = formatFloat(data["dash"]["flac"]["audio"]["bandwidth"].asInt() / 1000.0, "", 0, 1) + "K";
-					dictionary flacqualityitem;
-					flacqualityitem["url"] = data["dash"]["flac"]["audio"]["baseUrl"].asString();
-					flacqualityitem["quality"] = "FLAC" +flacquality;
-					flacqualityitem["qualityDetail"] = flacqualityitem["quality"];
-					flacqualityitem["itag"] = 258;
-					QualityList.insertLast(flacqualityitem);
-				}
-				JsonValue audios = data["dash"]["audio"];
-				if (@QualityList !is null) {
-					for (int i = 0; i < audios.size(); i++) {
-						string audioquality;
-						audioquality = formatFloat(audios[i]["bandwidth"].asInt() / 1000.0, "", 0, 1) + "K";
-						dictionary audioqualityitem;
-						int audioid = audios[i]["id"].asInt();
-						int audioitag = getAudioItag(audioid);
-						audioqualityitem["url"] = audios[i]["baseUrl"].asString();
-						audioqualityitem["quality"] =  "AAC " + audioquality;
-						audioqualityitem["qualityDetail"] = audioqualityitem["quality"];
-						audioqualityitem["itag"] = audioitag;
-						QualityList.insertLast(audioqualityitem);
-					}
-				}
+void appendDashAudio(JsonValue audio, string codec, int itag, array<dictionary> &QualityList) {
+	if (@QualityList is null || !audio.isObject()) return;
+	string url = streamUrl(audio);
+	if (url.empty()) return;
+	dictionary item;
+	item["url"] = url;
+	item["quality"] = codec + " " + formatFloat(audio["bandwidth"].asInt() / 1000.0, "", 0, 1) + "K";
+	item["qualityDetail"] = item["quality"];
+	item["itag"] = itag;
+	log("DASH audio", codec + " itag=" + itag + " host=" + HostRegExpParse(url, "^https?://([^/]+)"));
+	QualityList.insertLast(item);
+}
+
+void loadVideoPlayerInfo(string bvid, string cid, dictionary &MetaData, array<dictionary> &subtitle, string aid="") {
+	JsonReader reader;
+	JsonValue root;
+	string identity = bvid.empty() ? "aid=" + aid : "bvid=" + bvid;
+	string res = apiPost("/x/player/wbi/v2?" + identity + "&cid=" + cid);
+	// Subtitles and chapters are optional: a failed metadata API must not block playback.
+	if (reader.parse(res, root) && root.isObject() && root["code"].isNumeric() && root["code"].asInt() == 0) {
+		JsonValue data = root["data"];
+		JsonValue subs = data["subtitle"]["subtitles"];
+		if (ConfigData.danmakuEnable && !ConfigData.subtitleUrl.empty() && subs.isArray()) {
+			for (int i = 0; i < subs.size(); i++) {
+				string subUrl = subs[i]["subtitle_url"].asString();
+				if (subUrl.empty()) continue;
+				if (subUrl.find("//") == 0) subUrl = "https:" + subUrl;
+				dictionary sub;
+				sub["name"] = "【字幕】" + subs[i]["lan_doc"].asString();
+				sub["url"] = ConfigData.subtitleUrl + HostUrlEncode(subUrl);
+				subtitle.insertLast(sub);
 			}
-			if (data["durl"].isArray() && data["durl"].size() > 0) {
-				url = data["durl"][0]["url"].asString();
+		}
+		JsonValue points = data["view_points"];
+		array<dictionary> chapters;
+		if (points.isArray()) {
+			for (int i = 0; i < points.size(); i++) {
+				dictionary chapter;
+				chapter["title"] = points[i]["content"].asString();
+				chapter["time"] = formatUInt(points[i]["from"].asInt() * 1000);
+				chapters.insertLast(chapter);
 			}
-			if (data["dash"].isObject() && (!data["durl"].isArray() || data["durl"].size() == 0)) {
-				if (!ispgc) {
-					string flv_res = apiPost("/x/player/playurl?avid=" + aid + "&cid=" + cid + "&qn=" + qn + "&fnval=16&fourk=1");
-					if (!flv_res.empty()) {
-						JsonValue flv_root;
-						if (reader.parse(flv_res, flv_root) && flv_root.isObject()) {
-							if (flv_root["code"].asInt() == 0) {
-								JsonValue flv_data = flv_root["data"];
-								if (flv_data["durl"].isArray() && flv_data["durl"].size() > 0) {
-									url = flv_data["durl"][0]["url"].asString();
-								}
-							}
-						}
-					}
-				}
+		}
+		if (!chapters.empty()) MetaData["chapter"] = chapters;
+	} else {
+		log("Optional player info unavailable; continuing playback");
+	}
+}
+
+string Video(string bvid, const string &in path, dictionary &MetaData, array<dictionary> &QualityList) {
+	uint started = HostGetTickCount();
+	string aid = parse(path, "aid");
+	string cid = parse(path, "cid");
+	string epid = HostRegExpParse(path, "bangumi/play/ep([0-9]+)");
+	if (epid.empty()) epid = parse(path, "ep_id");
+	bool ispgc = !epid.empty();
+	int qn = parseInt(parse(path, "qn", "127"));
+	if (qn <= 0) qn = 127;
+	int p = parseInt(parse(path, "p", "1"));
+	string title;
+	string webUrl = path;
+	MetaData["webUrl"] = makeWebUrl(webUrl);
+
+	if (aid.empty() || cid.empty()) {
+		JsonReader reader;
+		JsonValue root;
+		string res = apiPost("/x/web-interface/view?bvid=" + bvid);
+		if (!reader.parse(res, root) || !root.isObject() || !root["code"].isNumeric() || root["code"].asInt() != 0) return "";
+		JsonValue data = root["data"];
+		JsonValue pages = data["pages"];
+		if (!pages.isArray() || pages.size() == 0) return "";
+		if (!cid.empty()) {
+			for (int i = 0; i < pages.size(); i++) {
+				if (pages[i]["cid"].asString() == cid) { p = i + 1; break; }
 			}
-			if (!data["dash"].isObject() && data["durl"].isArray()) {
-				url = data["durl"][0]["url"].asString();
-				qn = data["quality"].asInt();
-				dictionary qualityitem;
-				int codecid = data["video_codecid"].asInt();
-				JsonValue qualities = data["accept_quality"];
-				if (@QualityList !is null) {
-					for (uint i = 0; i < qualities.size(); i++) {
-						int quality = qualities[i].asInt();
-						dictionary qualityitem;
-						int quality_codecid;
-						if (quality == qn) {
-							qualityitem["url"] = url;
-							quality_codecid = codecid;
-						} else {
-							string quality_res;
-							quality_res = apiPost("/x/player/playurl?avid=" + aid + "&cid=" + cid + "&qn=" + quality + "&fnval=16&fourk=1");
-							JsonValue temp;
-							if (reader.parse(quality_res, temp) && temp.isObject()) {
-								if (temp["code"].asInt() != 0) {
-									continue;
-								}
-								JsonValue quality_data = temp["data"];
-								if (quality_data["durl"].isArray()) {
-									qualityitem["url"] = quality_data["durl"][0]["url"].asString();
-									quality_codecid = quality_data["video_codecid"].asInt();
-								}
-							}
-						}
-						int itag = quality * 10 + quality_codecid;
-						int trueitag = getTrueItag(itag);
-						qualityitem["quality"] = getVideoquality(quality) + getCodec(quality_codecid);
-						qualityitem["qualityDetail"] = qualityitem["quality"];
-						qualityitem["itag"] = trueitag;
-						QualityList.insertLast(qualityitem);
-					}
-					if (QualityList.length() == 1) {
-						dictionary qualityitem2;
-						if (data["durl"][0]["backup_url"].isArray() && data["durl"][0]["backup_url"].size() > 0) {
-							qualityitem2["url"] = data["durl"][0]["backup_url"][0].asString();
-						} else {
-							qualityitem2["url"] = url;
-						}
-						qualityitem2["quality"] = "- " + getVideoquality(qn) + getCodec(codecid) + " 备用";
-						qualityitem2["qualityDetail"] = qualityitem2["quality"];
-						qualityitem2["itag"] = 1;
-						QualityList.insertLast(qualityitem2);
-					}
-				}
-			}
-		} else {
-			log("Video playurl response code != 0", root["code"].asInt());
-			log("Video playurl response message", root["message"].asString());
-			return url;
+		}
+		if (p < 1 || p > pages.size()) return "";
+		aid = data["aid"].asString();
+		cid = pages[p-1]["cid"].asString();
+		title = pages[p-1]["part"].asString();
+		if (title.empty()) title = data["title"].asString();
+		MetaData["title"] = title;
+		MetaData["author"] = data["owner"]["name"].asString();
+		MetaData["viewCount"] = data["stat"]["view"].asString();
+		MetaData["likeCount"] = data["stat"]["like"].asString();
+		MetaData["thumbnail"] = data["pic"].asString();
+		string desc = data["desc"].asString();
+		MetaData["content"] = title + (desc.empty() ? "" : " | " + desc);
+		string redirect = data["redirect_url"].asString();
+		if (redirect.find("bangumi/play/ep") >= 0) {
+			epid = HostRegExpParse(redirect, "bangumi/play/ep([0-9]+)");
+			ispgc = true;
+			webUrl = redirect;
+			MetaData["webUrl"] = makeWebUrl(webUrl);
 		}
 	}
-	if (!title.empty()) {
-		log("title", title);
-	}
-	log("aid", aid);
-	log("bvid", bvid);
-	log("cid", cid);
-	log("url", url);
+	if (aid.empty() || cid.empty()) return "";
 
+	status = 3;
+	bool preflight = @QualityList is null;
+	JsonValue data = videoPlayData(aid, cid, bvid, epid, ispgc, qn, false, preflight);
+	string url;
+	JsonValue dash = data["dash"];
+	log("playurl selected quality", data["quality"].asInt());
+	if (dash.isObject()) {
+		JsonValue videos = dash["video"];
+		log("DASH video count", videos.size());
+		bool lockQuality = false;
+		if (!parse(path, "qn").empty() && videos.isArray()) {
+			for (int i = 0; i < videos.size(); i++) {
+				if (videos[i]["id"].asInt() == qn && (!videos[i]["baseUrl"].asString().empty() || !videos[i]["base_url"].asString().empty())) {
+					lockQuality = true;
+					break;
+				}
+			}
+		}
+		if (videos.isArray()) {
+			for (int i = 0; i < videos.size(); i++) {
+				JsonValue video = videos[i];
+				int quality = video["id"].asInt();
+				if (lockQuality && quality != qn) continue;
+				int codecid = video["codecid"].asInt();
+				string videoUrl = streamUrl(video);
+				if (videoUrl.empty()) continue;
+				// Preserve the stable original plugin's fallback URL order for both
+				// the preliminary probe and the complete QualityList parse.
+				url = videoUrl;
+				if (@QualityList is null) continue;
+				dictionary item;
+				item["url"] = videoUrl;
+				item["quality"] = getVideoquality(quality) + getCodec(codecid);
+				item["qualityDetail"] = item["quality"];
+				item["itag"] = getTrueItag(quality * 10 + codecid);
+				log("DASH video", "qn=" + quality + " codec=" + codecid + " itag=" + getTrueItag(quality * 10 + codecid)
+					+ " host=" + HostRegExpParse(videoUrl, "^https?://([^/]+)"));
+				// Keep the original plugin's stream/container timing autodetection.
+				// In particular do not force fps or a different demuxer via format.
+				if (quality == 122) item["isHDR"] = false;
+				QualityList.insertLast(item);
+			}
+		}
+		JsonValue dolby = dash["dolby"]["audio"];
+		if (dolby.isArray() && dolby.size() > 0) appendDashAudio(dolby[0], "EC-3", 328, QualityList);
+		appendDashAudio(dash["flac"]["audio"], "FLAC", 258, QualityList);
+		JsonValue audios = dash["audio"];
+		if (audios.isArray()) {
+			for (int i = 0; i < audios.size(); i++) appendDashAudio(audios[i], "AAC", getAudioItag(audios[i]["id"].asInt()), QualityList);
+		}
+		// fnval=16 is DASH too. Never issue a second "FLV fallback" for valid DASH.
+	} else if (data["durl"].isArray() && data["durl"].size() > 0) {
+		url = streamUrl(data["durl"][0]);
+		int actualQn = data["quality"].asInt();
+		int codecid = data["video_codecid"].asInt();
+		if (@QualityList !is null && !url.empty()) {
+			dictionary item;
+			item["url"] = url;
+			item["quality"] = getVideoquality(actualQn) + getCodec(codecid);
+			item["qualityDetail"] = item["quality"];
+			item["itag"] = 22; // Progressive MP4 contains both video and audio.
+			QualityList.insertLast(item);
+			// Opt-in only: each additional progressive quality costs a synchronous API call.
+			JsonValue qualities = data["accept_quality"];
+			if (ConfigData.enumerateProgressiveQualities && qualities.isArray()) {
+				for (int i = 0; i < qualities.size(); i++) {
+					int quality = qualities[i].asInt();
+					if (quality == actualQn) continue;
+					JsonValue other = videoPlayData(aid, cid, bvid, epid, ispgc, quality, true);
+					if (other["quality"].asInt() != quality || !other["durl"].isArray() || other["durl"].size() == 0) continue;
+					string otherUrl = streamUrl(other["durl"][0]);
+					if (otherUrl.empty()) continue;
+					dictionary extra;
+					extra["url"] = otherUrl;
+					extra["quality"] = getVideoquality(quality) + getCodec(other["video_codecid"].asInt());
+					extra["qualityDetail"] = extra["quality"];
+					extra["itag"] = 22;
+					QualityList.insertLast(extra);
+				}
+			}
+		}
+	}
+
+	if (url.empty()) return "";
+	log("return stream host", HostRegExpParse(url, "^https?://([^/]+)"));
+	if (@QualityList !is null) log("return quality items", QualityList.length());
+	array<dictionary> subtitle;
+	if (ConfigData.danmakuEnable && !ConfigData.danmakuUrl.empty()) {
+		dictionary sub;
+		sub["name"] = "【弹幕】" + title;
+		sub["url"] = ConfigData.danmakuUrl + cid;
+		subtitle.insertLast(sub);
+	}
+	if (ConfigData.loadPlayerInfo) loadVideoPlayerInfo(bvid, cid, MetaData, subtitle, aid);
+	if (!subtitle.empty()) MetaData["subtitle"] = subtitle;
+	log("Video parse elapsed ms", int(HostGetTickCount() - started));
 	return url;
 }
 
@@ -1276,48 +1347,68 @@ string md2ss(string mdid) {
 	return ssid;
 }
 
-// type: meida_id/season_id/ep_id
+void appendBangumiEpisodes(JsonValue episodes, array<dictionary> &videos, array<string> &seen) {
+	if (!episodes.isArray()) return;
+	for (int i = 0; i < episodes.size(); i++) {
+		JsonValue item = episodes[i];
+		string epid = item["id"].asString();
+		string aid = item["aid"].asString();
+		string cid = item["cid"].asString();
+		if (epid.empty() || aid.empty() || cid.empty() || seen.find(epid) >= 0) continue;
+		seen.insertLast(epid);
+		dictionary video;
+		string title = item["share_copy"].asString();
+		if (title.empty()) {
+			title = item["title"].asString();
+			string longTitle = item["long_title"].asString();
+			if (!longTitle.empty()) title += " " + longTitle;
+		}
+		string badge = item["badge"].asString();
+		video["title"] = (badge.empty() ? "" : "【" + badge + "】") + title;
+		video["duration"] = item["duration"].asInt();
+		// Carry the IDs the list already supplies. No view/season lookup on selection.
+		video["url"] = "https://www.bilibili.com/bangumi/play/ep" + epid + "?aid=" + aid + "&cid=" + cid;
+		video["thumbnail"] = item["cover"].asString();
+		videos.insertLast(video);
+	}
+}
+
+// type: media_id/season_id/ep_id
 array<dictionary> Banggumi(string id, string type) {
+	uint started = HostGetTickCount();
 	array<dictionary> videos;
-	JsonReader Reader;
-	JsonValue Root;
+	array<string> seen;
 	if (type == "media_id") {
 		id = md2ss(id);
-		if (id.empty()) {
-			return videos;
-		}
+		if (id.empty()) return videos;
 		type = "season_id";
 	}
-	string url = "/pgc/view/web/season?" + type + "=" + id;
-	log("Banggumi request", url);
-	string res = apiPost(url);
-	if (res.empty()) {
-		log("Banggumi response EMPTY");
-		return videos;
-	}
-	if (Reader.parse(res, Root) && Root.isObject()) {
-		if (Root["code"].asInt() != 0) {
-			log("Banggumi code != 0", Root["code"].asInt());
-			log("Banggumi message", Root["message"].asString());
-			return videos;
-		}
-		JsonValue episodes = Root["result"]["episodes"];
-		if (episodes.isArray()) {
-			for (int i = 0; i < episodes.size(); i++) {
-				JsonValue item = episodes[i];
-				dictionary video;
-				if (item["badge"].asString().empty()) {
-					video["title"] = item["share_copy"].asString();
-				} else {
-					video["title"] = "【" + item["badge"].asString() + "】" + item["share_copy"].asString();
+	JsonReader reader;
+	JsonValue root;
+	if (type == "season_id") {
+		// The season detail response repeats rich episode metadata in several
+		// sections. ss28747 is ~1.65 MB; section is ~224 KB for the whole list.
+		string response = apiPost("/pgc/web/season/section?season_id=" + id);
+		if (reader.parse(response, root) && root.isObject() && root["code"].isNumeric() && root["code"].asInt() == 0) {
+			appendBangumiEpisodes(root["result"]["main_section"]["episodes"], videos, seen);
+			if (ConfigData.bangumiIncludeExtras) {
+				JsonValue sections = root["result"]["section"];
+				if (sections.isArray()) {
+					for (int i = 0; i < sections.size(); i++) appendBangumiEpisodes(sections[i]["episodes"], videos, seen);
 				}
-				video["duration"] = item["duration"].asInt();
-				video["url"] = "https://www.bilibili.com/video/" + item["bvid"].asString() + "?cid=" + item["cid"].asString();
-				video["thumbnail"] = item["cover"].asString();
-				videos.insertLast(video);
+			}
+			if (!videos.empty()) {
+				log("Bangumi playlist elapsed ms", int(HostGetTickCount() - started));
+				return videos;
 			}
 		}
 	}
+	// Older titles or an unavailable compact endpoint retain the detail fallback.
+	string response = apiPost("/pgc/view/web/season?" + type + "=" + id);
+	if (reader.parse(response, root) && root.isObject() && root["code"].isNumeric() && root["code"].asInt() == 0) {
+		appendBangumiEpisodes(root["result"]["episodes"], videos, seen);
+	}
+	log("Bangumi playlist elapsed ms", int(HostGetTickCount() - started));
 	return videos;
 }
 
@@ -1551,7 +1642,7 @@ int getItag(int qn) {
 }
 
 int getVideoItag(int qn) {
-	array<int> qns = {127, 126, 125, 120, 116, 112, 80, 74, 64, 32, 16, 6};
+	array<int> qns = {127, 126, 125, 122, 120, 116, 112, 80, 74, 64, 32, 16, 6};
 	int idx = qns.find(qn);
 	if (idx >= 0) {
 		return idx;
@@ -1560,6 +1651,13 @@ int getVideoItag(int qn) {
 }
 
 int getTrueItag(int itag) {
+	// Keep all 122 profiles non-60p. Bilibili's 122 AV1 is often 25 fps, so the
+	// 60p profile 315 is not suitable. 337 is the native 4K HDR slot for 125 HEVC,
+	// freeing 266 for 122 AVC without duplicate IDs.
+	if (itag == 1262) return 337;
+	if (itag == 1227) return 266;
+	if (itag == 1232) return 313;
+	if (itag == 1233) return 314;
 	array<int> itags = {1282,1283,1272,1273,1262,1263,1207,1212,1213,1167,1172,1173,1127,1132,1133,807,812,813,647,652,653,327,332,333,167,172,173,67,72,73};
 	array<int> tis = {102,571,101,702,266,701,138,272,401,299,303,699,264,271,400,137,248,399,136,247,398,135,244,397,134,243,396,133,242,395};
 	int idx = itags.find(itag);
@@ -1580,8 +1678,8 @@ int getAudioItag(int id) {
 }
 
 string getVideoquality(int qn) {
-	array<int> qns = {127, 126, 125, 120, 116, 112, 80, 74, 64, 32, 16, 6};
-	array<string> qualities = {"8K 超高清", "杜比视界", "HDR 真彩色", "4K 超清", "1080P60 高帧率", "1080P+ 高码率", "1080P 高清", "720P60 高帧率", "720P 高清", "480P 清晰", "360P 流畅", "240P 极速"};
+	array<int> qns = {127, 126, 125, 122, 120, 116, 112, 80, 74, 64, 32, 16, 6};
+	array<string> qualities = {"8K 超高清", "杜比视界", "HDR 真彩色", "4K SDR增强", "4K 超清", "1080P60 高帧率", "1080P+ 高码率", "1080P 高清", "720P60 高帧率", "720P 高清", "480P 清晰", "360P 流畅", "240P 极速"};
 	int idx = qns.find(qn);
 	if (idx >= 0) {
 		return qualities[idx];
@@ -1600,6 +1698,7 @@ string getCodec(int codecid) {
 }
 
 string getLiveQuality(int qn) {
+	if (qn == 30000) return "杜比视界";
 	if (qn == 20000) return "4K超高清";
 	if (qn == 15000) return "2K（原画）";
 	if (qn == 10000) return "1080p（原画）";
@@ -1850,6 +1949,9 @@ bool PlaylistCheck(const string &in path) {
 	if (path.find("bilibili.com") < 0) {
 		return false;
 	}
+	if (path.find("bangumi/play/ep") >= 0 && !parse(path, "aid").empty() && !parse(path, "cid").empty()) {
+		return false;
+	}
 	if (!parseBVId(path).empty() || !parseAVId(path).empty()) {
 		return true;
 	}
@@ -2026,6 +2128,9 @@ string PlayitemParse(const string &in path, dictionary &MetaData, array<dictiona
 		string epid = HostRegExpParse(path, "bangumi/play/ep([0-9]+)");
 		log("Bangumi epid", epid);
 		if (!epid.empty()) {
+			if (!parse(path, "aid").empty() && !parse(path, "cid").empty()) {
+				return Video(parse(path, "bvid"), path, MetaData, QualityList);
+			}
 			string apiUrl = "/pgc/view/web/season?ep_id=" + epid;
 			string res = apiPost(apiUrl);
 			log("Bangumi season API response length", res.length());
@@ -2078,13 +2183,9 @@ string PlayitemParse(const string &in path, dictionary &MetaData, array<dictiona
 					break;
 				}
 			}
-			if (bvid.empty()) {
-				log("Bangumi ep not found by id, using first episode");
-				bvid = episodes[0]["bvid"].asString();
-				cid = episodes[0]["cid"].asString();
-				aid = episodes[0]["aid"].asString();
-				title = episodes[0]["share_copy"].asString();
-				cover = episodes[0]["cover"].asString();
+			if (bvid.empty() || cid.empty() || aid.empty()) {
+				log("Requested Bangumi episode not found");
+				return "";
 			}
 			log("Bangumi bvid", bvid);
 			log("Bangumi cid", cid);
@@ -2097,7 +2198,7 @@ string PlayitemParse(const string &in path, dictionary &MetaData, array<dictiona
 				MetaData["thumbnail"] = cover;
 			}
 			if (!bvid.empty()) {
-				string videoUrl = "https://www.bilibili.com/video/" + bvid + "?cid=" + cid + "&aid=" + aid;
+				string videoUrl = path + (path.find("?") >= 0 ? "&" : "?") + "cid=" + cid + "&aid=" + aid;
 				log("Bangumi calling Video with URL", videoUrl);
 				return Video(bvid, videoUrl, MetaData, QualityList);
 			}
@@ -2122,4 +2223,3 @@ string PlayitemParse(const string &in path, dictionary &MetaData, array<dictiona
 
 	return path;
 }
-
