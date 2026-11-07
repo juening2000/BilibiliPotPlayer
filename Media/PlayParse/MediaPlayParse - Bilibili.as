@@ -523,6 +523,64 @@ JsonValue videoPlayData(string aid, string cid, string bvid, string epid, bool i
 	return JsonValue();
 }
 
+array<int> getSupportedVideoQualities(JsonValue data) {
+	array<int> qualities;
+	if (!data.isObject()) return qualities;
+	JsonValue advertised = data["accept_quality"];
+	if (advertised.isArray()) {
+		for (int i = 0; i < advertised.size(); i++) {
+			if (!advertised[i].isNumeric()) continue;
+			int quality = advertised[i].asInt();
+			if (quality > 0 && qualities.find(quality) < 0) qualities.insertLast(quality);
+		}
+	}
+	if (!qualities.empty()) return qualities;
+	// Older or incomplete responses may omit accept_quality. Fall back only to
+	// qualities actually present in this response, never to a hardcoded list.
+	JsonValue videos;
+	if (data["dash"].isObject()) videos = data["dash"]["video"];
+	if (videos.isArray()) {
+		for (int i = 0; i < videos.size(); i++) {
+			if (!videos[i].isObject() || !videos[i]["id"].isNumeric()) continue;
+			int quality = videos[i]["id"].asInt();
+			if (quality > 0 && qualities.find(quality) < 0) qualities.insertLast(quality);
+		}
+	}
+	int current = data["quality"].asInt();
+	if (data["durl"].isArray() && data["durl"].size() > 0 && current > 0 && qualities.find(current) < 0) qualities.insertLast(current);
+	return qualities;
+}
+
+string getVideoQualityLabel(JsonValue data, int quality) {
+	JsonValue formats = data["support_formats"];
+	if (formats.isArray()) {
+		for (int i = 0; i < formats.size(); i++) {
+			JsonValue format = formats[i];
+			if (!format.isObject() || !format["quality"].isNumeric() || format["quality"].asInt() != quality) continue;
+			string label;
+			if (format["new_description"].isString()) label = format["new_description"].asString();
+			if (label.empty() && format["description"].isString()) label = format["description"].asString();
+			string display;
+			if (format["display_desc"].isString()) display = format["display_desc"].asString();
+			if (label.empty()) label = display;
+			else if (!display.empty() && label.find(display) < 0) label = display.find(label) >= 0 ? display : display + " " + label;
+			string suffix;
+			if (format["superscript"].isString()) suffix = format["superscript"].asString();
+			if (!suffix.empty() && label.find(suffix) < 0) label += (label.empty() ? "" : " ") + suffix;
+			if (!label.empty()) return label;
+		}
+	}
+	JsonValue qualities = data["accept_quality"];
+	JsonValue descriptions = data["accept_description"];
+	if (qualities.isArray() && descriptions.isArray()) {
+		for (int i = 0; i < qualities.size() && i < descriptions.size(); i++) {
+			if (qualities[i].isNumeric() && qualities[i].asInt() == quality && descriptions[i].isString() && !descriptions[i].asString().empty()) return descriptions[i].asString();
+		}
+	}
+	string fallback = getVideoquality(quality);
+	return fallback == "未知" ? "画质 " + quality : fallback;
+}
+
 void appendDashAudio(JsonValue audio, string codec, int itag, array<dictionary> &QualityList) {
 	if (@QualityList is null || !audio.isObject()) return;
 	string url = streamUrl(audio);
@@ -624,25 +682,34 @@ string Video(string bvid, const string &in path, dictionary &MetaData, array<dic
 	status = 3;
 	bool preflight = @QualityList is null;
 	JsonValue data = videoPlayData(aid, cid, bvid, epid, ispgc, qn, false, preflight);
+	array<int> supportedQualities = getSupportedVideoQualities(data);
+	string supportedText;
+	for (uint i = 0; i < supportedQualities.length(); i++) supportedText += (i == 0 ? "" : ",") + supportedQualities[i];
+	log("response supported qualities", supportedText);
 	string url;
 	JsonValue dash = data["dash"];
-	log("playurl selected quality", data["quality"].asInt());
+	log("playurl response quality", data["quality"].asInt());
 	if (dash.isObject()) {
 		JsonValue videos = dash["video"];
 		log("DASH video count", videos.size());
 		bool lockQuality = false;
-		if (!parse(path, "qn").empty() && videos.isArray()) {
+		if (!parse(path, "qn").empty() && supportedQualities.find(qn) >= 0 && videos.isArray()) {
 			for (int i = 0; i < videos.size(); i++) {
+				if (!videos[i].isObject() || !videos[i]["id"].isNumeric()) continue;
 				if (videos[i]["id"].asInt() == qn && (!videos[i]["baseUrl"].asString().empty() || !videos[i]["base_url"].asString().empty())) {
 					lockQuality = true;
 					break;
 				}
 			}
 		}
+		array<dictionary> videoItems;
+		array<int> videoItemQualities;
 		if (videos.isArray()) {
 			for (int i = 0; i < videos.size(); i++) {
 				JsonValue video = videos[i];
+				if (!video.isObject() || !video["id"].isNumeric()) continue;
 				int quality = video["id"].asInt();
+				if (supportedQualities.find(quality) < 0) continue;
 				if (lockQuality && quality != qn) continue;
 				int codecid = video["codecid"].asInt();
 				string videoUrl = streamUrl(video);
@@ -653,7 +720,7 @@ string Video(string bvid, const string &in path, dictionary &MetaData, array<dic
 				if (@QualityList is null) continue;
 				dictionary item;
 				item["url"] = videoUrl;
-				item["quality"] = getVideoquality(quality) + getCodec(codecid);
+				item["quality"] = getVideoQualityLabel(data, quality) + getCodec(codecid);
 				item["qualityDetail"] = item["quality"];
 				item["itag"] = getTrueItag(quality * 10 + codecid);
 				log("DASH video", "qn=" + quality + " codec=" + codecid + " itag=" + getTrueItag(quality * 10 + codecid)
@@ -661,7 +728,17 @@ string Video(string bvid, const string &in path, dictionary &MetaData, array<dic
 				// Keep the original plugin's stream/container timing autodetection.
 				// In particular do not force fps or a different demuxer via format.
 				if (quality == 122) item["isHDR"] = false;
-				QualityList.insertLast(item);
+				videoItems.insertLast(item);
+				videoItemQualities.insertLast(quality);
+			}
+		}
+		// Menu order follows accept_quality; codec order within each quality is
+		// preserved. The fallback URL above keeps the stable original stream order.
+		if (@QualityList !is null) {
+			for (uint qi = 0; qi < supportedQualities.length(); qi++) {
+				for (uint vi = 0; vi < videoItems.length(); vi++) {
+					if (videoItemQualities[vi] == supportedQualities[qi]) QualityList.insertLast(videoItems[vi]);
+				}
 			}
 		}
 		JsonValue dolby = dash["dolby"]["audio"];
@@ -679,15 +756,14 @@ string Video(string bvid, const string &in path, dictionary &MetaData, array<dic
 		if (@QualityList !is null && !url.empty()) {
 			dictionary item;
 			item["url"] = url;
-			item["quality"] = getVideoquality(actualQn) + getCodec(codecid);
+			item["quality"] = getVideoQualityLabel(data, actualQn) + getCodec(codecid);
 			item["qualityDetail"] = item["quality"];
 			item["itag"] = 22; // Progressive MP4 contains both video and audio.
 			QualityList.insertLast(item);
 			// Opt-in only: each additional progressive quality costs a synchronous API call.
-			JsonValue qualities = data["accept_quality"];
-			if (ConfigData.enumerateProgressiveQualities && qualities.isArray()) {
-				for (int i = 0; i < qualities.size(); i++) {
-					int quality = qualities[i].asInt();
+			if (ConfigData.enumerateProgressiveQualities) {
+				for (uint i = 0; i < supportedQualities.length(); i++) {
+					int quality = supportedQualities[i];
 					if (quality == actualQn) continue;
 					JsonValue other = videoPlayData(aid, cid, bvid, epid, ispgc, quality, true);
 					if (other["quality"].asInt() != quality || !other["durl"].isArray() || other["durl"].size() == 0) continue;
@@ -695,7 +771,7 @@ string Video(string bvid, const string &in path, dictionary &MetaData, array<dic
 					if (otherUrl.empty()) continue;
 					dictionary extra;
 					extra["url"] = otherUrl;
-					extra["quality"] = getVideoquality(quality) + getCodec(other["video_codecid"].asInt());
+					extra["quality"] = getVideoQualityLabel(data, quality) + getCodec(other["video_codecid"].asInt());
 					extra["qualityDetail"] = extra["quality"];
 					extra["itag"] = 22;
 					QualityList.insertLast(extra);
