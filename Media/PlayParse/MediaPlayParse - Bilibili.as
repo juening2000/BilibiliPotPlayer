@@ -577,8 +577,9 @@ string getVideoQualityLabel(JsonValue data, int quality) {
 			if (qualities[i].isNumeric() && qualities[i].asInt() == quality && descriptions[i].isString() && !descriptions[i].asString().empty()) return descriptions[i].asString();
 		}
 	}
-	string fallback = getVideoquality(quality);
-	return fallback == "未知" ? "画质 " + quality : fallback;
+	// No hardcoded qn -> name table: support_formats and accept_description are
+	// the only name sources. Incomplete responses still get a stable label.
+	return "画质 " + quality;
 }
 
 void appendDashAudio(JsonValue audio, string codec, int itag, array<dictionary> &QualityList) {
@@ -1466,11 +1467,12 @@ string md2ss(string mdid) {
 	return ssid;
 }
 
-void appendBangumiEpisodes(JsonValue episodes, array<dictionary> &videos, array<string> &seen) {
+void appendBangumiEpisodes(JsonValue episodes, array<dictionary> &videos, array<string> &seen, string onlyEpid = "") {
 	if (!episodes.isArray()) return;
 	for (int i = 0; i < episodes.size(); i++) {
 		JsonValue item = episodes[i];
 		string epid = item["id"].asString();
+		if (!onlyEpid.empty() && epid != onlyEpid) continue;
 		string aid = item["aid"].asString();
 		string cid = item["cid"].asString();
 		if (epid.empty() || aid.empty() || cid.empty() || seen.find(epid) >= 0) continue;
@@ -1526,6 +1528,58 @@ array<dictionary> Banggumi(string id, string type) {
 	string response = apiPost("/pgc/view/web/season?" + type + "=" + id);
 	if (reader.parse(response, root) && root.isObject() && root["code"].isNumeric() && root["code"].asInt() == 0) {
 		appendBangumiEpisodes(root["result"]["episodes"], videos, seen);
+		// An episode link builds the whole season list. Put the linked episode
+		// first so PotPlayer starts it instead of episode 1. PV/花絮/预告 links
+		// also prepend their own item, so an unrelated main episode cannot be
+		// shown in their place. Reuses appendBangumiEpisodes instead of a second
+		// list implementation.
+		if (type == "ep_id") {
+			int target = -1;
+			for (int i = 0; i < int(videos.length()); i++) {
+				string videoUrl;
+				if (videos[i].get("url", videoUrl) && videoUrl.find("/ep" + id + "?") >= 0) {
+					target = i;
+					break;
+				}
+			}
+			if (target < 0) {
+				JsonValue sections = root["result"]["section"];
+				if (sections.isArray()) {
+					for (int i = 0; i < sections.size(); i++) {
+						JsonValue sectionEpisodes = sections[i]["episodes"];
+						if (!sectionEpisodes.isArray()) continue;
+						bool containsTarget = false;
+						for (int j = 0; j < sectionEpisodes.size(); j++) {
+							if (sectionEpisodes[j]["id"].asString() == id) {
+								containsTarget = true;
+								break;
+							}
+						}
+						if (!containsTarget) continue;
+						appendBangumiEpisodes(sectionEpisodes, videos, seen, id);
+						break;
+					}
+				}
+				for (int i = 0; i < int(videos.length()); i++) {
+					string videoUrl;
+					if (videos[i].get("url", videoUrl) && videoUrl.find("/ep" + id + "?") >= 0) {
+						target = i;
+						break;
+					}
+				}
+			}
+			if (target > 0) {
+				// Rotate from the linked episode: target, following episodes, then
+				// the earlier ones. The first item is the link's own episode.
+				array<dictionary> reordered;
+				for (int i = target; i < int(videos.length()); i++) reordered.insertLast(videos[i]);
+				for (int i = 0; i < target; i++) reordered.insertLast(videos[i]);
+				videos.resize(0);
+				for (uint i = 0; i < reordered.length(); i++) videos.insertLast(reordered[i]);
+			} else if (target < 0) {
+				log("Bangumi target episode missing from playlist", id);
+			}
+		}
 	}
 	log("Bangumi playlist elapsed ms", int(HostGetTickCount() - started));
 	return videos;
@@ -1760,15 +1814,6 @@ int getItag(int qn) {
 	return qn;
 }
 
-int getVideoItag(int qn) {
-	array<int> qns = {127, 126, 125, 122, 120, 116, 112, 80, 74, 64, 32, 16, 6};
-	int idx = qns.find(qn);
-	if (idx >= 0) {
-		return idx;
-	}
-	return qn;
-}
-
 int getTrueItag(int itag) {
 	// Keep all 122 profiles non-60p. Bilibili's 122 AV1 is often 25 fps, so the
 	// 60p profile 315 is not suitable. 337 is the native 4K HDR slot for 125 HEVC,
@@ -1796,16 +1841,6 @@ int getAudioItag(int id) {
 	return id;
 }
 
-string getVideoquality(int qn) {
-	array<int> qns = {127, 126, 125, 122, 120, 116, 112, 80, 74, 64, 32, 16, 6};
-	array<string> qualities = {"8K 超高清", "杜比视界", "HDR 真彩色", "4K SDR增强", "4K 超清", "1080P60 高帧率", "1080P+ 高码率", "1080P 高清", "720P60 高帧率", "720P 高清", "480P 清晰", "360P 流畅", "240P 极速"};
-	int idx = qns.find(qn);
-	if (idx >= 0) {
-		return qualities[idx];
-	}
-	return "未知";
-}
-
 string getCodec(int codecid) {
 	array<int> codecids = {7, 12, 13};
 	array<string> codec = {" AVC", " HEVC", " AV1"};
@@ -1814,18 +1849,6 @@ string getCodec(int codecid) {
 		return codec[idx];
 	}
 	return "未知";
-}
-
-string getLiveQuality(int qn) {
-	if (qn == 30000) return "杜比视界";
-	if (qn == 20000) return "4K超高清";
-	if (qn == 15000) return "2K（原画）";
-	if (qn == 10000) return "1080p（原画）";
-	if (qn == 400) return "1080p（蓝光）";
-	if (qn == 250) return "720p（超清）";
-	if (qn == 150) return "480p（高清）";
-	if (qn == 80) return "360p（流畅）";
-	return "";
 }
 
 string Audio(const string &in path, dictionary &MetaData, array<dictionary> &QualityList) {
@@ -1957,10 +1980,15 @@ string Live(string id, const string &in path, dictionary &MetaData, array<dictio
 			}
 
 		if (@QualityList !is null && accept_qn.isArray()) {
+			array<int> seenLiveQualities;
 			for (int qi = 0; qi < accept_qn.size(); qi++) {
 				int qn = accept_qn[qi].asInt();
-				string label = getLiveQuality(qn);
-				if (label.empty() && g_qn_desc.isArray()) {
+				if (qn <= 0 || seenLiveQualities.find(qn) >= 0) continue;
+				seenLiveQualities.insertLast(qn);
+				// The live API's g_qn_desc is authoritative. 30000 (Dolby) is
+				// shown with the API's own name; no local qn table is used.
+				string label;
+				if (g_qn_desc.isArray()) {
 					for (int di = 0; di < g_qn_desc.size(); di++) {
 						if (g_qn_desc[di]["qn"].asInt() == qn) {
 							label = g_qn_desc[di]["desc"].asString();
@@ -1968,7 +1996,7 @@ string Live(string id, const string &in path, dictionary &MetaData, array<dictio
 						}
 					}
 				}
-				if (label.empty()) continue;
+				if (label.empty()) label = "画质 " + qn;
 
 				string qn_url;
 				string qn_codec;
@@ -2300,6 +2328,30 @@ string PlayitemParse(const string &in path, dictionary &MetaData, array<dictiona
 					title = episodes[i]["share_copy"].asString();
 					cover = episodes[i]["cover"].asString();
 					break;
+				}
+			}
+			// PV/花絮/预告 live in result.section, not result.episodes. Without
+			// this lookup the link falls through to the playlist's first item.
+			if (bvid.empty() || cid.empty() || aid.empty()) {
+				JsonValue sections = result["section"];
+				if (sections.isArray()) {
+					for (int i = 0; i < sections.size(); i++) {
+						JsonValue sectionEpisodes = sections[i]["episodes"];
+						if (!sectionEpisodes.isArray()) continue;
+						bool found = false;
+						for (int j = 0; j < sectionEpisodes.size(); j++) {
+							if (sectionEpisodes[j]["id"].asInt() == parseInt(epid)) {
+								bvid = sectionEpisodes[j]["bvid"].asString();
+								cid = sectionEpisodes[j]["cid"].asString();
+								aid = sectionEpisodes[j]["aid"].asString();
+								title = sectionEpisodes[j]["share_copy"].asString();
+								cover = sectionEpisodes[j]["cover"].asString();
+								found = true;
+								break;
+							}
+						}
+						if (found) break;
+					}
 				}
 			}
 			if (bvid.empty() || cid.empty() || aid.empty()) {
